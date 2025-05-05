@@ -73,26 +73,45 @@ def summarize_video():
         }), 400
     
     try:
-        extractor = VideoExtractor(proxy=app.config['PROXY_URL'])
+        # Default browsers to try for cookies
+        default_browser = os.getenv('YOUTUBE_BROWSER', 'chrome')
+        # Get cookies file if set
+        cookies_file = os.getenv('YOUTUBE_COOKIES_FILE')
+        
+        extractor = VideoExtractor(
+            proxy=app.config['PROXY_URL'], 
+            cookies_file=cookies_file,
+            cookies_browser=default_browser if not cookies_file else None
+        )
         summarizer = Summarizer()
 
-        # Download metadata
+        # Try to download metadata
         video_info = extractor.extract_video_info(url)
+        
+        # If regular extraction fails, try caption-only extraction
+        if not video_info:
+            app.logger.info("Regular extraction failed, trying caption-only extraction")
+            video_info = extractor.extract_captions_only(url)
+            
         if not video_info:
             return jsonify({
                 "error": "Failed to download video info"
             }), 500
 
         video_id = video_info['id']
-        duration = video_info['duration']
+        
+        # Check if duration is available (might not be in caption-only extraction)
+        duration = video_info.get('duration')
+        if duration:
+            # If video too long, reject
+            print(f'Video id: {video_id}, duration: {duration} = {duration//60}:{duration%60:02}')
 
-        # If video too long, reject
-        print(f'Video id: {video_id}, duration: {duration} = {duration//60}:{duration%60:02}')
-
-        if duration >= app.config['MAX_VIDEO_DURATION']:
-            return jsonify({
-                "error": "Too long video"
-            }), 400
+            if duration >= app.config['MAX_VIDEO_DURATION']:
+                return jsonify({
+                    "error": "Too long video"
+                }), 400
+        else:
+            app.logger.warning(f"Duration not available for video {video_id}")
      
         # Get captions
         caption_track = extractor.get_captions_by_priority(video_info)
@@ -112,6 +131,12 @@ def summarize_video():
         caption_text = extractor.parse_captions(ext, downloaded_content)
 
         print(f'Caption length: {len(caption_text)}')
+        
+        # Make sure we have required fields for summarization
+        if not video_info.get('fulltitle'):
+            video_info['fulltitle'] = video_info.get('title', f'YouTube Video {video_id}')
+        if not video_info.get('description'):
+            video_info['description'] = '(No description available)'
         
         # Generate summaries
         summaries = summarizer.summarize(caption_text, video_info)

@@ -28,7 +28,7 @@ def validate_youtube_url(url: str) -> bool:
         return False
 
 class VideoExtractor:
-    def __init__(self, proxy: Optional[str] = None):
+    def __init__(self, proxy: Optional[str] = None, cookies_file: Optional[str] = None, cookies_browser: Optional[str] = None):
         ensure_cache_dir()
 
         self.ydl_opts = {
@@ -39,8 +39,16 @@ class VideoExtractor:
             'skip_download': True,  # Don't download the video file
             'quiet': False,
             'no_warnings': False,
-            'no-playlist': True
+            'no-playlist': True,
+            'format': 'best[height<=144]',  # Request minimal format since we're not downloading
+            'ignore_no_formats_error': True  # Ignore if format is not available
         }
+
+        # Add cookies option if provided
+        if cookies_file:
+            self.ydl_opts['cookiefile'] = cookies_file
+        elif cookies_browser:
+            self.ydl_opts['cookiesfrombrowser'] = (cookies_browser, None, None, None)
 
         if proxy:
             print(f'Setting proxy: {proxy[:10]}...')
@@ -268,7 +276,7 @@ class VideoExtractor:
 
         return result
 
-    def extract_video_info(self, url: str) -> Tuple[Optional[Dict], Optional[str]]:
+    def extract_video_info(self, url: str) -> Optional[Dict]:
         """
         Extract video description and captions from a YouTube URL.
         
@@ -276,9 +284,7 @@ class VideoExtractor:
             url: YouTube video URL
             
         Returns:
-            Tuple containing:
-            - Dictionary with video information (title, description)
-            - String containing the captions/subtitles
+            Dictionary with video information (title, description, etc.)
         """
 
         video_id = yt_dlp.extractor.youtube.YoutubeIE.extract_id(url)
@@ -289,18 +295,84 @@ class VideoExtractor:
             return json.load(open(cache_file))
 
         try:
-            with yt_dlp.YoutubeDL(self.ydl_opts) as ydl:
+            # Create a copy of options with even more lenient settings for info extraction
+            info_opts = self.ydl_opts.copy()
+            info_opts.update({
+                'format': 'best[height<=144]/worst',  # Try for minimal format or worst available
+                'ignore_no_formats_error': True,
+                'ignoreerrors': True
+            })
+            
+            with yt_dlp.YoutubeDL(info_opts) as ydl:
                 # Get video info
                 video_info = ydl.extract_info(f'https://youtube.com/watch?v={video_id}', download=False)
+                if not video_info:
+                    print(f"Error: No video info extracted for {video_id}")
+                    return None
+                    
                 video_id = video_info['id']
+                
+                # Cache the results
+                with open(cache_file, 'w') as f:
+                    json.dump(video_info, f, indent=4)
+                    
+                return video_info
+                
         except YoutubeDLError as e:
             print(f"Error extracting video information: {str(e)}")
-            return None, None
-        
-        with open(cache_file, 'w') as f:
-            json.dump(video_info, f, indent=4)
+            return None
+        except Exception as e:
+            print(f"Unexpected error during video extraction: {str(e)}")
+            return None
 
-        return video_info
+    def extract_captions_only(self, url: str) -> Optional[Dict]:
+        """
+        Try to extract only captions when full video info extraction fails.
+        This is a fallback method for when videos have format issues.
+        
+        Args:
+            url: YouTube video URL
+            
+        Returns:
+            Dictionary with minimal video information and captions
+        """
+        video_id = yt_dlp.extractor.youtube.YoutubeIE.extract_id(url)
+        
+        try:
+            # Create options focused only on subtitle extraction
+            caption_opts = {
+                'skip_download': True,
+                'writesubtitles': True,
+                'writeautomaticsub': True,
+                'subtitleslangs': ['en', 'en-US', 'en-CA'],
+                'quiet': False,
+                'ignoreerrors': True,
+                'no_warnings': True,
+                'extract_flat': True,  # Don't extract video formats
+                'skip_download': True
+            }
+            
+            # Add cookies if we have them
+            if 'cookiefile' in self.ydl_opts:
+                caption_opts['cookiefile'] = self.ydl_opts['cookiefile']
+            elif 'cookiesfrombrowser' in self.ydl_opts:
+                caption_opts['cookiesfrombrowser'] = self.ydl_opts['cookiesfrombrowser']
+                
+            if 'proxy' in self.ydl_opts:
+                caption_opts['proxy'] = self.ydl_opts['proxy']
+            
+            with yt_dlp.YoutubeDL(caption_opts) as ydl:
+                info = ydl.extract_info(f'https://youtube.com/watch?v={video_id}', download=False)
+                
+                if not info or not (info.get('subtitles') or info.get('automatic_captions')):
+                    print(f"No captions found for video {video_id}")
+                    return None
+                    
+                return info
+                
+        except Exception as e:
+            print(f"Error extracting captions: {str(e)}")
+            return None
 
 class Summarizer:
     def __init__(self, model: str = None, base_url: str = None, api_key: str = None):
@@ -442,9 +514,17 @@ def main():
     parser.add_argument('url', help='YouTube video URL')
     parser.add_argument('--output', '-o', help='Output file path (optional)')
     parser.add_argument('--proxy', '-x', help='Proxy URL (optional)')
+    parser.add_argument('--cookies-file', help='Path to cookies file')
+    parser.add_argument('--cookies-browser', choices=['chrome', 'firefox', 'safari', 'edge', 'opera'],
+                        default=os.getenv('YOUTUBE_BROWSER', 'chrome'),
+                        help='Browser to extract cookies from (default: chrome)')
     args = parser.parse_args()
 
-    extractor = VideoExtractor(proxy=args.proxy)
+    extractor = VideoExtractor(
+        proxy=args.proxy,
+        cookies_file=args.cookies_file,
+        cookies_browser=args.cookies_browser if not args.cookies_file else None
+    )
     summarizer = Summarizer()
 
     # Download metadata
